@@ -1,2 +1,2 @@
 # zkteco
-Biometrics Logs Extractor
+Desktop UI for extracting and organizing ZKTeco attendance logs.
