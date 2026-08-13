@@ -1,0 +1,36 @@
+{
+  "groups": {
+    "Plato": {
+      "file": "plato_attendance_records.csv",
+      "cutoff": "2026-08-01",
+      "members": [
+        {"id": 49, "name": "Nicole"},
+        {"id": 62, "name": "Ritehly"},
+        {"id": 65, "name": "Andrea"},
+        {"id": 75, "name": "Nicely"},
+        {"id": 76, "name": "Davy"},
+        {"id": 106, "name": "SY"},
+        {"id": 157, "name": "Mark"},
+        {"id": 176, "name": "James"},
+        {"id": 197, "name": "Jerome"},
+        {"id": 233, "name": "Jessie"},
+        {"id": 317, "name": "Weinand"},
+        {"id": 331, "name": "Renee"},
+        {"id": 348, "name": "Dan"},
+        {"id": 349, "name": "Rica"},
+        {"id": 351, "name": "Jen"},
+        {"id": 353, "name": "Dex"},
+        {"id": 361, "name": "Kristine"},
+        {"id": 373, "name": "Harrie"}
+      ]
+    },
+    "Aquaporin": {
+      "file": "aquaporin_attendance_records.csv",
+      "cutoff": "2026-07-26",
+      "members": [
+        {"id": 121, "name": "shunki-san"},
+        {"id": 159, "name": "danna-san"}
+      ]
+    }
+  }
+}
