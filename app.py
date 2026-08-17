@@ -499,6 +499,7 @@ class AttendanceApp(tk.Tk):
         self._set_connection_controls_enabled(True)
         if success:
             message = f"Connected to {device_name} ({ip}). The machine responded to the connection test."
+            print(f"[Connection successful] {device_name} ({ip}) responded to the connection test.", flush=True)
             self.status_var.set(message)
             messagebox.showinfo("Connection successful", message, parent=self)
         else:
@@ -520,7 +521,8 @@ class AttendanceApp(tk.Tk):
             count = zkteco.export_group(group_name, output, ip=ip, port=port, groups=self.groups)
             self.after(0, lambda: self._export_finished(f"Exported {count:,} record(s) from {device_name} to {output}"))
         except Exception as exc:
-            self.after(0, lambda: self._export_failed(str(exc)))
+            error_message = str(exc)
+            self.after(0, lambda message=error_message: self._export_failed(message))
 
     def _export_finished(self, message: str):
         self.status_var.set(message)

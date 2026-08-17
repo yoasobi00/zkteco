@@ -308,6 +308,7 @@ def fetch_attendance(
     conn = device.connect()
     if not conn:
         raise ConnectionError("The device connection failed")
+    print(f"[Connection successful] Connected to ZKTeco device at {ip}:{port}.", flush=True)
     try:
         attendance = list(conn.get_attendance())
         names: dict[int, str] = {}
