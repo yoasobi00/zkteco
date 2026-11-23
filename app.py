@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import queue
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -189,6 +190,21 @@ class GroupEditor(tk.Toplevel):
         ttk.Button(member_bar, text="Edit", command=self.edit_member).pack(side="right", padx=(0, 7))
         ttk.Button(member_bar, text="Remove", command=self.remove_member).pack(side="right", padx=(0, 7))
 
+        # Pack the action bar before the expanding member table so the save
+        # button always remains visible, even when the dialog is resized.
+        actions = ttk.Frame(body, style="Surface.TFrame")
+        actions.pack(side="bottom", fill="x", pady=(18, 0))
+        ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right")
+        self.save_button = ttk.Button(
+            actions,
+            text="Save group",
+            style="Accent.TButton",
+            command=self.save,
+        )
+        self.save_button.pack(side="right", padx=(0, 8))
+        self.bind("<Return>", lambda _event: self.save())
+        self.bind("<Escape>", lambda _event: self.destroy())
+
         table_frame = ttk.Frame(body, style="Surface.TFrame")
         table_frame.pack(fill="both", expand=True)
         self.members = ttk.Treeview(table_frame, columns=("id", "name"), show="headings", selectmode="browse")
@@ -203,11 +219,6 @@ class GroupEditor(tk.Toplevel):
         for member in data.get("members", []):
             if isinstance(member, dict):
                 self.members.insert("", "end", values=(member.get("id", ""), member.get("name", "")))
-
-        actions = ttk.Frame(body, style="Surface.TFrame")
-        actions.pack(fill="x", pady=(18, 0))
-        ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right")
-        ttk.Button(actions, text="Save group", style="Accent.TButton", command=self.save).pack(side="right", padx=(0, 8))
 
     def add_member(self):
         self._member_dialog()
@@ -287,8 +298,12 @@ class AttendanceApp(tk.Tk):
         self.output_var = tk.StringVar(value=str(Path.cwd() / "attendance_all.csv"))
         self.status_var = tk.StringVar(value="Ready to connect to the attendance device.")
         self.network_warning_var = tk.StringVar()
+        self._export_events = queue.Queue()
+        self._cancel_export_event = threading.Event()
+        self._export_running = False
         self._build_styles()
         self._build_ui()
+        self.after(100, self._poll_export_events)
 
     def _build_styles(self):
         style = ttk.Style(self)
@@ -375,8 +390,14 @@ class AttendanceApp(tk.Tk):
         output_row.pack(fill="x", pady=(7, 24))
         ttk.Entry(output_row, textvariable=self.output_var).pack(side="left", fill="x", expand=True)
         ttk.Button(output_row, text="Browse", command=self.browse_output).pack(side="right", padx=(8, 0))
-        self.export_button = ttk.Button(extract, text="Extract & export", style="Accent.TButton", command=self.start_export)
-        self.export_button.pack(anchor="w")
+        export_actions = ttk.Frame(extract, style="Card.TFrame")
+        export_actions.pack(fill="x")
+        self.export_button = ttk.Button(export_actions, text="Extract & export", style="Accent.TButton", command=self.start_export)
+        self.export_button.pack(side="left")
+        self.cancel_button = ttk.Button(export_actions, text="Cancel", command=self.cancel_export, state="disabled")
+        self.cancel_button.pack(side="left", padx=(8, 0))
+        self.progress_bar = ttk.Progressbar(extract, mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", pady=(16, 0))
         ttk.Label(extract, textvariable=self.status_var, style="CardMuted.TLabel", wraplength=550).pack(anchor="w", pady=(20, 0))
 
         groups_card = ttk.Frame(content, style="Card.TFrame", padding=22)
@@ -451,6 +472,8 @@ class AttendanceApp(tk.Tk):
             self.output_var.set(selected)
 
     def start_export(self):
+        if self._export_running:
+            return
         try:
             device_name = self.device_var.get().strip()
             device = self.devices[device_name]
@@ -464,9 +487,24 @@ class AttendanceApp(tk.Tk):
             messagebox.showerror("Missing output", "Choose a CSV output file first.", parent=self)
             return
         group_name = None if self.mode_var.get() == "All logs" else self.mode_var.get()
-        self.status_var.set("Connecting and reading attendance logs…")
+        self._cancel_export_event.clear()
+        self._export_running = True
+        self.cancel_button.configure(state="normal")
+        self._show_export_progress("Checking device connection…", None)
         self._set_connection_controls_enabled(False)
         threading.Thread(target=self._export_worker, args=(group_name, output, ip, port, device_name), daemon=True).start()
+
+    def cancel_export(self):
+        if not self._export_running:
+            return
+        self._cancel_export_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_var.set("Cancelling… Waiting for the current device operation to finish.")
+
+    def _reset_export_controls(self):
+        self._export_running = False
+        self.cancel_button.configure(state="disabled")
+        self._set_connection_controls_enabled(True)
 
     def _set_connection_controls_enabled(self, enabled: bool):
         state = "normal" if enabled else "disabled"
@@ -513,25 +551,72 @@ class AttendanceApp(tk.Tk):
 
     def _export_worker(self, group_name, output, ip, port, device_name):
         try:
-            if not zkteco.ping_machine(ip, attempts=3):
+            zkteco.report_progress(f"Checking {device_name} ({ip}); up to 3 ping attempts…", progress=self._queue_export_progress)
+            if not zkteco.ping_machine(ip, attempts=3, cancel_event=self._cancel_export_event):
+                zkteco.check_cancelled(self._cancel_export_event)
                 raise ConnectionError(
                     f"Unable to connect to {device_name} ({ip}) after 3 ping attempts. "
                     "Check the network and use Test connection before extracting logs again."
                 )
-            count = zkteco.export_group(group_name, output, ip=ip, port=port, groups=self.groups)
-            self.after(0, lambda: self._export_finished(f"Exported {count:,} record(s) from {device_name} to {output}"))
+            count = zkteco.export_group(group_name, output, ip=ip, port=port, groups=self.groups, progress=self._queue_export_progress, cancel_event=self._cancel_export_event)
+            self._export_events.put(("finished", f"Exported {count:,} record(s) from {device_name} to {output}"))
+        except zkteco.ExtractionCancelled:
+            self._export_events.put(("cancelled", None))
         except Exception as exc:
+            if self._cancel_export_event.is_set():
+                self._export_events.put(("cancelled", None))
+                return
             error_message = str(exc)
-            self.after(0, lambda message=error_message: self._export_failed(message))
+            print(f"[Extraction failed] {error_message}", flush=True)
+            self._export_events.put(("failed", error_message))
+
+    def _queue_export_progress(self, message, percent):
+        self._export_events.put(("progress", (message, percent)))
+
+    def _poll_export_events(self):
+        # Tk widgets are only accessed on the main thread.
+        try:
+            while True:
+                event, payload = self._export_events.get_nowait()
+                if event == "progress":
+                    if not self._cancel_export_event.is_set():
+                        self._show_export_progress(*payload)
+                elif event == "cancelled":
+                    self._export_cancelled()
+                elif event == "finished":
+                    self._export_finished(payload)
+                elif event == "failed":
+                    self._export_failed(payload)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_export_events)
+
+    def _show_export_progress(self, message, percent):
+        if percent is None:
+            if str(self.progress_bar["mode"]) != "indeterminate":
+                self.progress_bar.configure(mode="indeterminate", value=0)
+                self.progress_bar.start(15)
+        else:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate", value=percent)
+        self.status_var.set(f"{message} ({percent}%)" if percent is not None else message)
+
+    def _export_cancelled(self):
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate", value=0)
+        self.status_var.set("Extraction cancelled. No CSV changes were saved.")
+        self._reset_export_controls()
 
     def _export_finished(self, message: str):
-        self.status_var.set(message)
-        self._set_connection_controls_enabled(True)
+        self._show_export_progress(message, 100)
+        self._reset_export_controls()
         messagebox.showinfo("Export complete", message, parent=self)
 
     def _export_failed(self, message: str):
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate", value=0)
         self.status_var.set("Export failed. Check the device connection and try again.")
-        self._set_connection_controls_enabled(True)
+        self._reset_export_controls()
         title = "Unable to connect" if message.startswith("Unable to connect") else "Export failed"
         messagebox.showerror(title, message, parent=self)
 

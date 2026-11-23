@@ -13,6 +13,8 @@ import json
 import platform
 import socket
 import subprocess
+import tempfile
+from threading import Event
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -29,6 +31,25 @@ DEVICES_FILE = BASE_DIR / "devices.json"
 DEFAULT_IP = "192.168.48.20"
 DEFAULT_PORT = 4370
 DEFAULT_CUTOFF = "2026-08-01"
+
+ProgressCallback = Callable[[str, int | None], None]
+
+
+class ExtractionCancelled(Exception):
+    """Raised when an extraction is cancelled before the CSV is committed."""
+
+
+def check_cancelled(cancel_event: Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ExtractionCancelled("Extraction cancelled.")
+
+
+def report_progress(message: str, percent: int | None = None, progress: ProgressCallback | None = None) -> None:
+    """Log a stage immediately and optionally forward it to the UI."""
+    suffix = f" ({percent}%)" if percent is not None else ""
+    print(f"[Extraction] {message}{suffix}", flush=True)
+    if progress is not None:
+        progress(message, percent)
 
 # Legacy device handle retained so callers can replace ``zkteco.zk`` in tests
 # or in small scripts without needing to know about the newer fetch helper.
@@ -87,6 +108,7 @@ def filter_records(
     member_names: Mapping[int, str] | None = None,
     cutoff: datetime | None = None,
     include_all: bool = False,
+    cancel_event: Event | None = None,
 ) -> list[tuple[int, str, str, str]]:
     """Normalize, optionally filter, and sort device records.
 
@@ -96,6 +118,7 @@ def filter_records(
     names = member_names or {}
     filtered: list[tuple[int, str, datetime]] = []
     for record in records:
+        check_cancelled(cancel_event)
         user_id, timestamp = _record_values(record)
         normalized_id = normalize_user_id(user_id)
         parsed_time = coerce_datetime(timestamp)
@@ -107,6 +130,7 @@ def filter_records(
             continue
         filtered.append((normalized_id, names.get(normalized_id, ""), parsed_time))
 
+    check_cancelled(cancel_event)
     filtered.sort(key=lambda item: (item[0], item[2]))
     return [
         (user_id, name, timestamp.strftime("%Y-%m-%d"), timestamp.strftime("%H:%M:%S"))
@@ -237,6 +261,7 @@ def ping_machine(
     attempts: int = 3,
     timeout: float = 1.0,
     runner: Callable[..., object] | None = None,
+    cancel_event: Event | None = None,
 ) -> bool:
     """Ping a machine up to ``attempts`` times and report whether it responds."""
     try:
@@ -255,6 +280,7 @@ def ping_machine(
 
     execute = runner or subprocess.run
     for _attempt in range(attempts):
+        check_cancelled(cancel_event)
         try:
             result = execute(
                 command,
@@ -263,6 +289,7 @@ def ping_machine(
                 check=False,
                 timeout=timeout + 0.5,
             )
+            check_cancelled(cancel_event)
             if getattr(result, "returncode", 1) == 0:
                 return True
         except (OSError, subprocess.TimeoutExpired):
@@ -299,38 +326,74 @@ def fetch_attendance(
     ip: str = DEFAULT_IP,
     port: int = DEFAULT_PORT,
     zk_factory: Callable[..., object] | None = None,
+    progress: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> tuple[list[object], dict[int, str]]:
     """Read attendance and device user names, returning both as plain data."""
+    check_cancelled(cancel_event)
     factory = zk_factory or ZK
     if factory is None:
         raise RuntimeError("The pyzk package is not installed. Install it with: pip install pyzk")
+    report_progress(f"Connecting to {ip}:{port}…", progress=progress)
     device = factory(ip, port=port, timeout=100)
+    check_cancelled(cancel_event)
     conn = device.connect()
     if not conn:
         raise ConnectionError("The device connection failed")
     print(f"[Connection successful] Connected to ZKTeco device at {ip}:{port}.", flush=True)
     try:
+        check_cancelled(cancel_event)
+        report_progress("Reading attendance logs from the device…", progress=progress)
         attendance = list(conn.get_attendance())
+        check_cancelled(cancel_event)
+        report_progress(f"Received {len(attendance):,} attendance records. Reading user names…", progress=progress)
         names: dict[int, str] = {}
         try:
+            check_cancelled(cancel_event)
             for user in conn.get_users():
+                check_cancelled(cancel_event)
                 user_id = normalize_user_id(getattr(user, "user_id", None))
                 if user_id is not None:
                     names[user_id] = str(getattr(user, "name", "") or "")
         except (AttributeError, OSError):
             # Some devices expose attendance but not the user directory.
-            pass
+            report_progress("User directory unavailable; continuing with available names.", progress=progress)
+        check_cancelled(cancel_event)
         return attendance, names
     finally:
+        report_progress("Disconnecting from the device…", progress=progress)
         conn.disconnect()
 
 
-def export_rows(rows: Sequence[tuple[int, str, str, str]], path: Path) -> None:
+def export_rows(
+    rows: Sequence[tuple[int, str, str, str]],
+    path: Path,
+    progress: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
+) -> None:
+    check_cancelled(cancel_event)
+    report_progress(f"Writing {len(rows):,} records to CSV…", 0, progress)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open(mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["User ID", "Name", "Date", "Time"])
-        writer.writerows(rows)
+    temporary_path = None
+    try:
+        # Commit only a complete export; cancellation preserves any existing CSV.
+        with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8",
+                                         dir=path.parent, prefix=f".{path.name}.",
+                                         suffix=".tmp", delete=False) as file:
+            temporary_path = Path(file.name)
+            writer = csv.writer(file)
+            writer.writerow(["User ID", "Name", "Date", "Time"])
+            batch_size = max(1, (len(rows) + 99) // 100)
+            for start in range(0, len(rows), batch_size):
+                check_cancelled(cancel_event)
+                end = min(start + batch_size, len(rows))
+                writer.writerows(rows[start:end])
+                report_progress(f"Writing CSV: {end:,}/{len(rows):,} records", min(99, end * 100 // len(rows)), progress)
+        check_cancelled(cancel_event)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def export_group(
@@ -339,19 +402,25 @@ def export_group(
     ip: str = DEFAULT_IP,
     port: int = DEFAULT_PORT,
     groups: Mapping[str, dict] | None = None,
+    progress: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> int:
     """Fetch, filter, and export one group or all device logs."""
     groups = groups or load_groups()
-    raw_records, device_names = fetch_attendance(ip, port)
+    check_cancelled(cancel_event)
+    raw_records, device_names = fetch_attendance(ip, port, progress=progress, cancel_event=cancel_event)
+    check_cancelled(cancel_event)
+    report_progress(f"Filtering and sorting {len(raw_records):,} records…", progress=progress)
     if group_name is None:
-        rows = filter_records(raw_records, member_names=device_names, include_all=True)
+        rows = filter_records(raw_records, member_names=device_names, include_all=True, cancel_event=cancel_event)
     else:
         group = groups[group_name]
         members = group_members(group)
         # Names explicitly maintained in a group take precedence over device names.
         cutoff = coerce_datetime(group.get("cutoff")) if group.get("cutoff") else None
-        rows = filter_records(raw_records, member_names=members, cutoff=cutoff)
-    export_rows(rows, output_path)
+        rows = filter_records(raw_records, member_names=members, cutoff=cutoff, cancel_event=cancel_event)
+    export_rows(rows, output_path, progress=progress, cancel_event=cancel_event)
+    report_progress(f"Export complete: {len(rows):,} records saved to {output_path}", 100, progress)
     return len(rows)
 
 
